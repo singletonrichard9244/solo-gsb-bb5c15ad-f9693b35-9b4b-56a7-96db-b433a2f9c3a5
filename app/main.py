@@ -69,8 +69,11 @@ from .models import (
     PackagePreviewIn,
     RegistryCyclesResponse,
     RegistryPreviewResponse,
+    RetirementPreviewIn,
+    RetirementPreviewResponse,
 )
 from .preview import build_preview_body, build_preview_registry
+from .retirements import dedupe_audit_ids, evaluate_retirement
 from .semver import Version, VersionError
 from .solver import Solver
 from .summary import InvalidTimeBound, build_audit_summary, parse_utc_bound
@@ -144,6 +147,7 @@ def index() -> dict:
             "GET /api/v1/registry/cycles",
             "PUT /api/v1/registry/packages/{name}",
             "POST /api/v1/registry/packages/{name}/preview",
+            "POST /api/v1/registry/retirements/preview",
             "GET /api/v1/registry/packages",
         ],
     }
@@ -896,6 +900,72 @@ def preview_package(name: str, payload: PackagePreviewIn, request: Request) -> R
         preview,
     )
     return RegistryPreviewResponse(**body)
+
+
+@app.post(
+    "/api/v1/registry/retirements/preview",
+    response_model=RetirementPreviewResponse,
+    tags=["registry"],
+    summary="版本退役评估：内存移除指定版本后，用原清单逐条重跑已保存的可行审计",
+)
+def preview_retirement(payload: RetirementPreviewIn, request: Request) -> RetirementPreviewResponse:
+    """纯内存评估一次版本退役对已保存审计的影响，**不写入注册表，也不写审计记录**。
+
+    请求体为 ``package`` / ``version``（合法 SemVer）与 1～20 个 ``audit_ids``
+    （重复 ID 按首次出现顺序去重）：
+
+    * 待退役版本或任一审计 ID 不存在返回 ``404``；任一审计状态不是 feasible
+      （infeasible/inconclusive）返回 ``422``；
+    * 在内存注册表中**仅移除** ``package@version``，对每条审计保存的原清单
+      重新求解；审计的根插件正是被退役版本时该条标记为 ``unavailable``；
+    * 按（去重后的）输入顺序逐条返回原解、重跑状态与选中版本差异；
+      重跑可行才给出差异，``unavailable`` / ``infeasible`` / ``inconclusive``
+      时差异置 ``null``（搜索不确定时不推断版本差异）；
+    * 任一条 unavailable、infeasible 或 inconclusive 时 ``can_retire=false``。
+    """
+    conn = get_conn(request)
+    registry = load_registry(conn)
+
+    if payload.version not in registry.get(payload.package, {}):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"版本不存在: {payload.package}@{payload.version}；"
+                f"可用版本：{sorted(registry.get(payload.package, {}), reverse=True)}"
+            ),
+        )
+
+    audit_ids = dedupe_audit_ids(payload.audit_ids)
+    for audit_id in audit_ids:
+        row = get_audit(conn, audit_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"审计记录不存在: {audit_id}")
+        if row["status"] != "feasible":
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"审计 {audit_id} 状态为 {row['status']}，仅可行（feasible）"
+                    "审计可参与退役评估"
+                ),
+            )
+
+    body = evaluate_retirement(conn, registry, payload.package, payload.version, audit_ids)
+    body["requested_audit_ids"] = list(payload.audit_ids)
+    # requested_audit_ids 放在 audit_ids 之前输出
+    ordered = [
+        "package",
+        "version",
+        "requested_audit_ids",
+        "audit_ids",
+        "total",
+        "feasible",
+        "infeasible",
+        "inconclusive",
+        "unavailable",
+        "can_retire",
+        "items",
+    ]
+    return RetirementPreviewResponse(**{key: body[key] for key in ordered})
 
 
 @app.get("/api/v1/registry/packages", response_model=dict, tags=["registry"])

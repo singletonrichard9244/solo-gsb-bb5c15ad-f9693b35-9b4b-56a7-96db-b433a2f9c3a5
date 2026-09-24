@@ -196,6 +196,112 @@ class RegistryPreviewResponse(BaseModel):
     changes: PreviewChangesOut = Field(..., description="当前 -> 预演的状态与选中版本变化")
 
 
+# ---------- 注册表版本退役评估 ----------
+
+
+class RetirementPreviewIn(BaseModel):
+    """退役评估请求：待退役的包版本 + 1～20 个已保存的可行审计 ID（可重复，自动去重）。"""
+
+    package: str = Field(
+        ...,
+        min_length=1,
+        description="待退役版本所属包名（去除首尾空白后不可为空、不可含空白字符）",
+    )
+    version: str = Field(..., description="待退役的具体版本，需为合法 SemVer")
+    audit_ids: List[str] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="已保存的可行审计 ID 列表，数量 1～20；重复 ID 自动去重并按首次出现顺序评估",
+    )
+
+    @field_validator("package")
+    @classmethod
+    def _validate_package(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(ch.isspace() for ch in value):
+            raise ValueError("包名非法")
+        return value
+
+    @field_validator("version")
+    @classmethod
+    def _validate_version(cls, value: str) -> str:
+        try:
+            return str(Version.parse(value))
+        except VersionError as exc:
+            raise ValueError(f"非法版本 {value!r}: {exc}") from exc
+
+    @field_validator("audit_ids")
+    @classmethod
+    def _validate_audit_ids(cls, value: List[str]) -> List[str]:
+        for audit_id in value:
+            if not isinstance(audit_id, str) or not audit_id.strip():
+                raise ValueError("audit_id 不能为空")
+        return value
+
+
+class RetirementSideOut(BaseModel):
+    """单条审计退役前/后的求解结果（仅状态与可行时的版本解）。"""
+
+    status: Literal["feasible", "infeasible", "inconclusive", "unavailable"] = Field(
+        ...,
+        description=(
+            "重跑状态：feasible/infeasible/inconclusive 为求解器结论；"
+            "unavailable 表示该审计的根插件正是被退役版本，清单无法再求解"
+        ),
+    )
+    resolution: Optional[Dict[str, str]] = Field(
+        None,
+        description="重跑可行时选中的版本解（包名 -> 版本）；其余状态为 null",
+    )
+
+
+class RetirementItemOut(BaseModel):
+    """单条审计的退役评估结果，顺序与去重后的 audit_ids 一致。"""
+
+    audit_id: str = Field(..., description="审计记录 ID")
+    original: PreviewSideOut = Field(..., description="退役前的原解（取自已保存审计，必然 feasible）")
+    rerun: RetirementSideOut = Field(..., description="在内存退役注册表上用原清单重跑的结果")
+    changes: Optional[PreviewResolutionDiffOut] = Field(
+        None,
+        description=(
+            "原解 -> 重跑选中版本的差异（added/removed/changed/unchanged）；"
+            "根版本被移除（unavailable）、重跑无解（infeasible）或搜索不确定"
+            "（inconclusive）时为 null，不推断版本差异"
+        ),
+    )
+
+
+class RetirementPreviewResponse(BaseModel):
+    """POST /api/v1/registry/retirements/preview：版本退役评估结果（不落库）。"""
+
+    package: str = Field(..., description="待退役版本所属包名")
+    version: str = Field(..., description="待退役版本（规范化 SemVer）")
+    requested_audit_ids: List[str] = Field(
+        ..., description="请求中提交的审计 ID（保留原始顺序与重复，供对照）"
+    )
+    audit_ids: List[str] = Field(
+        ..., description="去重后实际评估的审计 ID（按首次出现顺序）"
+    )
+    total: int = Field(..., description="去重后实际评估的审计条数（1～20）")
+    feasible: int = Field(..., description="重跑仍可行（feasible）的条数")
+    infeasible: int = Field(..., description="重跑无解（infeasible）的条数")
+    inconclusive: int = Field(..., description="重跑搜索不确定（inconclusive）的条数")
+    unavailable: int = Field(
+        ..., description="根插件版本正是被退役版本、清单不可用（unavailable）的条数"
+    )
+    can_retire: bool = Field(
+        ...,
+        description=(
+            "是否可以退役：所有审计重跑均可行（feasible）时为 true；"
+            "任一条 unavailable/infeasible/inconclusive 时为 false"
+        ),
+    )
+    items: List[RetirementItemOut] = Field(
+        ..., description="逐条评估结果，顺序与 audit_ids（去重后）完全一致"
+    )
+
+
 # ---------- 注册表循环依赖诊断 ----------
 
 
