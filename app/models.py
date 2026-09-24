@@ -196,6 +196,129 @@ class RegistryPreviewResponse(BaseModel):
     changes: PreviewChangesOut = Field(..., description="当前 -> 预演的状态与选中版本变化")
 
 
+# ---------- 注册表版本退役评估 ----------
+
+
+class RetirementPreviewIn(BaseModel):
+    """退役评估请求：包名 + 合法 SemVer 版本 + 1～20 个已保存的可行审计 ID。
+
+    重复的审计 ID 在评估时自动去重（保留首次出现的顺序），不视为错误。
+    """
+
+    package: str = Field(..., min_length=1, description="拟退役版本所属的包名")
+    version: str = Field(..., description="拟退役的具体版本（需为合法 SemVer）")
+    audit_ids: List[str] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="已保存的可行审计 ID 列表（1～20 个）；重复 ID 自动去重",
+    )
+
+    @field_validator("package")
+    @classmethod
+    def _validate_package(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(ch.isspace() for ch in value):
+            raise ValueError("包名非法")
+        return value
+
+    @field_validator("version")
+    @classmethod
+    def _validate_version(cls, value: str) -> str:
+        try:
+            return str(Version.parse(value))
+        except VersionError as exc:
+            raise ValueError(f"非法版本 {value!r}: {exc}") from exc
+
+    @field_validator("audit_ids")
+    @classmethod
+    def _validate_audit_ids(cls, value: List[str]) -> List[str]:
+        for audit_id in value:
+            if not isinstance(audit_id, str) or not audit_id.strip():
+                raise ValueError("audit_id 不能为空")
+        return value
+
+    def deduped_audit_ids(self) -> List[str]:
+        """按首次出现顺序去重后的审计 ID。"""
+        seen: set[str] = set()
+        result: List[str] = []
+        for audit_id in self.audit_ids:
+            if audit_id not in seen:
+                seen.add(audit_id)
+                result.append(audit_id)
+        return result
+
+
+class RetirementResolutionDiffOut(PreviewResolutionDiffOut):
+    """原解 -> 重跑解的选中版本差异（四种变化类型分区）。"""
+
+
+class RetirementItemOut(BaseModel):
+    """单条审计的退役评估结果（顺序与去重后的请求 ID 一致）。"""
+
+    index: int = Field(..., description="该项在去重后 audit_ids 中的下标（0 起）")
+    audit_id: str = Field(..., description="评估的已保存审计 ID")
+    original_status: Literal["feasible"] = Field(
+        ..., description="原审计的求解状态（仅 feasible 审计可参与评估）"
+    )
+    original_resolution: Dict[str, str] = Field(
+        ..., description="原审计保存的可行版本解（包名 -> 版本）"
+    )
+    rerun_status: Literal["feasible", "infeasible", "inconclusive", "unavailable"] = Field(
+        ...,
+        description=(
+            "退役后用原清单重新求解的状态："
+            "unavailable=该审计的根插件版本正是被退役版本（不再求解）；"
+            "inconclusive=搜索预算耗尽、结论不确定"
+        ),
+    )
+    rerun_resolution: Optional[Dict[str, str]] = Field(
+        None, description="重跑可行时的版本解；infeasible/inconclusive/unavailable 时为 null"
+    )
+    resolution_diff: Optional[RetirementResolutionDiffOut] = Field(
+        None,
+        description=(
+            "原解与重跑解的选中版本差异；根插件版本被移除（unavailable）或搜索不确定"
+            "（inconclusive）时为 null，不推断差异"
+        ),
+    )
+    reason: Optional[str] = Field(
+        None,
+        description="不可退役的具体原因（unavailable/infeasible/inconclusive 时给出）；可退役时为 null",
+    )
+
+
+class RetirementCountsOut(BaseModel):
+    """退役评估的逐项计数。"""
+
+    total: int = Field(..., description="去重后参与评估的审计条数")
+    feasible: int = Field(..., description="退役后仍可行（含版本解不变/移动）的条数")
+    infeasible: int = Field(..., description="退役后重跑无解的条数")
+    inconclusive: int = Field(..., description="退役后重跑搜索不确定的条数")
+    unavailable: int = Field(..., description="根插件版本被移除而不可用的条数")
+
+
+class RetirementPreviewResponse(BaseModel):
+    """POST /api/v1/registry/retirements/preview：版本退役评估结果（只读、纯内存）。"""
+
+    package: str = Field(..., description="拟退役版本所属的包名")
+    version: str = Field(..., description="拟退役的具体版本")
+    requested_audit_count: int = Field(
+        ..., description="请求提交的审计 ID 数量（含重复）"
+    )
+    duplicate_audit_ids: List[str] = Field(
+        ..., description="请求中重复出现的审计 ID（稳定排序去重列出）"
+    )
+    can_retire: bool = Field(
+        ...,
+        description="总体是否可以退役：任一条不可用、无解或搜索不确定时为 false",
+    )
+    counts: RetirementCountsOut = Field(..., description="按重跑状态分类的逐项计数")
+    items: List[RetirementItemOut] = Field(
+        ..., description="逐条评估结果，顺序与去重后的请求 ID 一致"
+    )
+
+
 # ---------- 注册表循环依赖诊断 ----------
 
 

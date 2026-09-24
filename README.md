@@ -13,6 +13,9 @@
   用强连通分量找出循环（含自依赖），返回涉及的包版本与依赖边，不写入审计或注册表；
 - 提供**注册表变更预演**：写入前在内存构造预演注册表，同一份清单分别在当前与预演
   注册表求解，对比两侧状态、可行版本解与目标包版本变化，不写入注册表或审计；
+- 提供**注册表版本退役评估**：在内存中移除指定包的单个版本，用每条已保存可行审计的
+  原清单逐条重新求解，返回原解/重跑状态/选中版本差异并给出总体可退役结论，
+  不写入注册表或审计；
 - 自带健康检查、OpenAPI 文档、示例注册表与一键 Docker Compose 启动。
 
 ## 一条命令启动
@@ -726,6 +729,103 @@ curl -s -X POST http://localhost:8000/api/v1/registry/packages/loggerkit/preview
 - **只读**：不修改注册表（随后的 `GET /api/v1/registry/packages` 结果不变），
   也不写审计记录或异步作业。
 
+### 11. 注册表版本退役评估（移除前逐条重跑，只读）
+
+计划从注册表中**退役（移除）某个包的单个具体版本**之前，先把 1～20 条**已保存的
+可行审计**交给退役评估接口：服务在内存注册表中移除该版本，然后对每条审计用其
+**保存时的原始清单**在退役后的注册表上重新求解，按输入顺序逐条返回原解、重跑状态
+与选中版本差异，并给出总体结论 `can_retire`。评估全程只读，不修改注册表、
+不写审计记录或异步作业，可重复调用。
+
+请求体：`package`（包名）、`version`（合法 SemVer）、`audit_ids`
+（1～20 个已保存的可行审计 ID；**重复 ID 自动去重**，按首次出现顺序评估，
+重复项在 `duplicate_audit_ids` 中列出）。
+
+先保存两条可行审计，再评估退役 `core-lib@1.5.0`：
+
+```bash
+# 审计 A：^1.0.0 当前选中 1.5.0
+AUDIT_A=$(curl -s -X POST http://localhost:8000/api/v1/audits \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies":[{"name":"core-lib","range":"^1.0.0"}]}' | jq -r .id)
+
+# 审计 B：=1.0.0 精确锁定 1.0.0（退役 1.5.0 不影响它）
+AUDIT_B=$(curl -s -X POST http://localhost:8000/api/v1/audits \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies":[{"name":"core-lib","range":"2.1.0"}]}' | jq -r .id)
+
+curl -s -X POST http://localhost:8000/api/v1/registry/retirements/preview \
+  -H 'Content-Type: application/json' \
+  -d "{\"package\":\"core-lib\",\"version\":\"1.5.0\",\"audit_ids\":[\"$AUDIT_A\",\"$AUDIT_B\"]}" | jq
+```
+
+返回（节选）：
+
+```json
+{
+  "package": "core-lib",
+  "version": "1.5.0",
+  "requested_audit_count": 2,
+  "duplicate_audit_ids": [],
+  "can_retire": true,
+  "counts": {"total": 2, "feasible": 2, "infeasible": 0, "inconclusive": 0, "unavailable": 0},
+  "items": [
+    {
+      "index": 0,
+      "audit_id": "…",
+      "original_status": "feasible",
+      "original_resolution": {"core-lib": "1.5.0"},
+      "rerun_status": "feasible",
+      "rerun_resolution": {"core-lib": "1.4.0"},
+      "resolution_diff": {
+        "added": {}, "removed": {},
+        "changed": {"core-lib": "1.4.0"},
+        "unchanged": {}
+      },
+      "reason": null
+    },
+    {
+      "index": 1,
+      "audit_id": "…",
+      "original_status": "feasible",
+      "original_resolution": {"core-lib": "2.1.0"},
+      "rerun_status": "feasible",
+      "rerun_resolution": {"core-lib": "2.1.0"},
+      "resolution_diff": {
+        "added": {}, "removed": {}, "changed": {},
+        "unchanged": {"core-lib": "2.1.0"}
+      },
+      "reason": null
+    }
+  ]
+}
+```
+
+重跑状态（`rerun_status`）有四种：
+
+| rerun_status | 含义 | resolution_diff |
+| --- | --- | --- |
+| `feasible` | 退役后原清单仍可行（版本解可能移动） | 给出 added/removed/changed/unchanged 分区 |
+| `infeasible` | 退役后重跑穷尽搜索、**无解** | 原解包整体计入 `removed`（重跑侧无版本解） |
+| `inconclusive` | 重跑**超过搜索预算**（默认 20000 节点），结论不确定 | `null`（**不推断**版本差异） |
+| `unavailable` | 该审计清单把 `package@version` 声明为**根插件**，根版本已被移除 | `null`（不再运行求解器，**不推断**） |
+
+要点：
+
+- **总体结论**：任一条 `unavailable` / `infeasible` / `inconclusive` 时
+  `can_retire=false`；全部 `feasible`（即使版本解下移）才为 `true`；
+- **逐条用原清单重跑**：每条审计都按其保存时提交的清单（含根插件声明与直接依赖）
+  在同一个内存退役注册表上重新求解，`items` 顺序与去重后的请求 ID 一致；
+- **根插件版本被移除**：清单的 `plugin_name/plugin_version` 正是被退役版本时，
+  该条直接标记 `unavailable`（根插件已不存在，无法求解），不运行求解器；
+- **搜索不确定不推断**：`inconclusive` 的条目只保留状态与原因，
+  `resolution_diff` 为 `null`；
+- **错误码**：包版本不存在或任一审计 ID 不存在返回 `404`；
+  审计存在但状态不是 `feasible`（infeasible/inconclusive）返回 `422`；
+  非法 SemVer、空 `audit_ids`、超过 20 个、空 ID 返回 `422`；
+- **只读**：不修改注册表（随后 `GET /api/v1/registry/packages` 结果不变），
+  也不写审计记录或异步作业。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -746,6 +846,7 @@ curl -s -X POST http://localhost:8000/api/v1/registry/packages/loggerkit/preview
 | `GET`  | `/api/v1/registry/packages` | 查看注册表全部包与版本 |
 | `PUT`  | `/api/v1/registry/packages/{name}` | 新增/覆盖一个包及其版本依赖 |
 | `POST` | `/api/v1/registry/packages/{name}/preview` | 注册表变更预演：内存构造写入后的注册表，对比同一份清单在当前/预演两侧的状态与版本解（只读，不写注册表或审计）；非法输入返回 `422` |
+| `POST` | `/api/v1/registry/retirements/preview` | 注册表版本退役评估：内存移除指定包版本后，用 1～20 条已保存可行审计的原清单逐条重跑（ID 去重），按序返回原解/重跑状态/版本差异与总体可退役结论（只读）；版本或审计不存在 `404`，审计非可行 `422` |
 
 ### 清单格式
 
@@ -804,6 +905,9 @@ pytest -q
 多包环的节点与分量内边、范围一对多展开、SemVer 数值序稳定排序、只读不产生审计/注册表写入），
 注册表变更预演（逐版本覆盖/其他版本保留的内存快照、两侧状态与版本解对比、
 新增/覆盖版本差异、搜索预算耗尽保留 inconclusive 且不推断变化、非法输入 422、只读不落库），
+注册表版本退役评估（内存移除单版本、重复审计 ID 去重与输入顺序、原清单逐条重跑的
+feasible/infeasible/inconclusive/unavailable 四态、根插件版本移除标不可用、
+版本解差异与不确定不推断、总体 can_retire、版本/审计不存在 404 与非可行 422、只读不落库），
 以及导出包的确定性、重复/未知 ID 错误码与逐字节/顺序篡改识别。
 
 ## 项目结构
@@ -821,6 +925,7 @@ app/
   impact.py     # 历史影响反查：resolution/sources/conflicts 扫描与层级计算
   cycles.py     # 只读注册表循环依赖诊断：按依赖范围构图 + Tarjan 强连通分量（纯内存）
   preview.py    # 注册表变更预演：内存构造写入快照、双注册表求解对比与变化分区（纯内存）
+  retirement.py # 注册表版本退役评估：内存移除单版本、原清单逐条重跑与差异/可用性判定（纯内存）
   bundle.py     # 可验证 JSONL 导出包的确定性构造与校验（sha256/gzip，纯内存）
 data/
   seed_registry.json   # 示例注册表

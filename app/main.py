@@ -69,8 +69,14 @@ from .models import (
     PackagePreviewIn,
     RegistryCyclesResponse,
     RegistryPreviewResponse,
+    RetirementCountsOut,
+    RetirementItemOut,
+    RetirementPreviewIn,
+    RetirementPreviewResponse,
+    RetirementResolutionDiffOut,
 )
 from .preview import build_preview_body, build_preview_registry
+from .retirement import evaluate_retirement, sorted_duplicate_ids
 from .semver import Version, VersionError
 from .solver import Solver
 from .summary import InvalidTimeBound, build_audit_summary, parse_utc_bound
@@ -144,6 +150,7 @@ def index() -> dict:
             "GET /api/v1/registry/cycles",
             "PUT /api/v1/registry/packages/{name}",
             "POST /api/v1/registry/packages/{name}/preview",
+            "POST /api/v1/registry/retirements/preview",
             "GET /api/v1/registry/packages",
         ],
     }
@@ -908,3 +915,109 @@ def list_packages(request: Request) -> dict:
             for name, versions in sorted(registry.items())
         }
     }
+
+
+@app.post(
+    "/api/v1/registry/retirements/preview",
+    response_model=RetirementPreviewResponse,
+    tags=["registry"],
+    summary="注册表版本退役评估：内存移除指定版本后，逐条重跑已保存的可行审计（只读）",
+)
+def preview_retirement(payload: RetirementPreviewIn, request: Request) -> RetirementPreviewResponse:
+    """在内存注册表中移除某个包的单个具体版本，用各审计的**原始清单**
+    逐条重新求解，评估该版本能否安全退役。
+
+    * 请求携带包名、合法 SemVer 版本与 1～20 个已保存的**可行**审计 ID；
+      重复 ID 自动按首次出现顺序去重（``duplicate_audit_ids`` 列出重复项）；
+    * 包版本不存在、或任一审计 ID 不存在返回 ``404``；
+      审计存在但状态不是 feasible 返回 ``422``；
+    * **根插件版本被移除**：审计清单把该版本声明为根插件时，该条直接标记
+      ``unavailable``，不再运行求解器；
+    * 逐条返回原解、重跑状态（feasible/infeasible/inconclusive/unavailable）、
+      重跑解与选中版本差异；任一条不可用、无解或搜索不确定时
+      ``can_retire=false``；``inconclusive`` / ``unavailable`` 时
+      ``resolution_diff`` 为 ``null``，不推断版本差异；
+    * **只读**：不写入注册表，也不写审计记录或异步作业，可重复调用。
+    """
+    conn = get_conn(request)
+    registry = load_registry(conn)
+
+    # 版本（或包）必须存在于注册表
+    if payload.version not in registry.get(payload.package, {}):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"注册表中不存在包版本 {payload.package}@{payload.version}；"
+                f"可用版本：{sorted(registry.get(payload.package, {}), reverse=True)}"
+            ),
+        )
+
+    # 重复 ID 去重（保留首次出现顺序）
+    audit_ids = payload.deduped_audit_ids()
+
+    rows = []
+    missing_ids: list[str] = []
+    non_feasible: list[str] = []
+    for audit_id in audit_ids:
+        row = get_audit(conn, audit_id)
+        if row is None:
+            missing_ids.append(audit_id)
+            continue
+        if row["status"] != "feasible":
+            non_feasible.append(audit_id)
+            continue
+        rows.append(row)
+
+    if missing_ids:
+        raise HTTPException(
+            status_code=404,
+            detail=f"审计记录不存在: {missing_ids}",
+        )
+    if non_feasible:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "退役评估只接受状态为 feasible 的审计，以下审计不可用于评估: "
+                f"{non_feasible}"
+            ),
+        )
+
+    audits = [
+        {"id": row["id"], "result_json": json.loads(row["result_json"]),
+         "manifest_json": json.loads(row["manifest_json"])}
+        for row in rows
+    ]
+    body = evaluate_retirement(
+        audits,
+        registry,
+        payload.package,
+        payload.version,
+        solver_factory=lambda reg: Solver(reg),
+    )
+
+    items = [
+        RetirementItemOut(
+            index=item["index"],
+            audit_id=item["audit_id"],
+            original_status=item["original_status"],
+            original_resolution=item["original_resolution"],
+            rerun_status=item["rerun_status"],
+            rerun_resolution=item["rerun_resolution"],
+            resolution_diff=(
+                RetirementResolutionDiffOut(**item["resolution_diff"])
+                if item["resolution_diff"] is not None
+                else None
+            ),
+            reason=item["reason"],
+        )
+        for item in body["items"]
+    ]
+    return RetirementPreviewResponse(
+        package=body["package"],
+        version=body["version"],
+        requested_audit_count=len(payload.audit_ids),
+        duplicate_audit_ids=sorted_duplicate_ids(payload.audit_ids),
+        can_retire=body["can_retire"],
+        counts=RetirementCountsOut(**body["counts"]),
+        items=items,
+    )
